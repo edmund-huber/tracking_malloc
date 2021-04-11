@@ -44,25 +44,28 @@ typedef struct alloc_entry {
     uint32_t magic;
 } alloc_entry_t;
 
-// The pthreads API doesn't give you a way to figure out if you are the holder
-// of a lock.
 __thread int this_thread_has_init_mutex = 0;
+
+typedef enum {
+    COLD_AND_DARK,
+    INITIALIZING,
+    ACTIVE,
+    PASSTHROUGH
+} context_mode_t;
 
 #define N_PREALLOCATIONS 8
 #define PREALLOCATION_SIZE 1024
 struct {
     // Why separate mutexes: separate threads could race to init(), so we must
-    // have a statically-initialized mutex to resolve that. However, pthreads
-    // do not provide an initializer for a recursive mutex, which is what we
-    // will want for actual operation.
+    // have a statically-initialized mutex to resolve that. However, the
+    // pthreads mutex static initializer, PTHREAD_MUTEX_INITIALIZER, specifies
+    // a default (not errorchecking, not recursive) mutex, which isn't what we
+    // want for actual operation. There exists
+    // PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP in glibc, but that isn't
+    // portable..
     pthread_mutex_t mutex_for_init;
     pthread_mutex_t mutex;
-    enum {
-        COLD_AND_DARK,
-        INITIALIZING,
-        ACTIVE,
-        PASSTHROUGH
-    } mode;
+    context_mode_t mode;
     struct {
         int is_free;
         char allocation[PREALLOCATION_SIZE];
@@ -93,7 +96,13 @@ static uint64_t time_in_ns(void) {
 }
 
 static void maybe_init(void) {
-    if (!this_thread_has_init_mutex) {
+    // We need to know if we are INITIALIZING already, because if we are, we
+    // don't want to enter the initialization code (below), which we are
+    // already executing! I don't see a way to check if we already hold the
+    // mutex, except this thread-local variable.
+    if (this_thread_has_init_mutex) {
+        ASSERT(context.mode == INITIALIZING);
+    } else {
         ASSERT(pthread_mutex_lock(&context.mutex_for_init) == 0);
         if (context.mode == COLD_AND_DARK) {
             // Establish that we are initializing, so that the following
@@ -198,11 +207,13 @@ static void maybe_print_stats(void) {
 
     // Any allocations we do here (asctime, gmtime definitely malloc at least
     // once) shouldn't count.
+    ASSERT(context.mode == ACTIVE);
     context.mode = PASSTHROUGH;
 
     // Only print stats at most every 5 seconds.
     uint64_t now = time_in_ns();
     if (now - stats.when_last_printed < 5e9) {
+        context.mode = ACTIVE;
         ASSERT(pthread_mutex_unlock(&context.mutex) == 0);
         return;
     }
@@ -300,15 +311,17 @@ void *malloc_inner(size_t requested_size, int alignment) {
             // Populate this alloc_entry_t ..
             alloc_entry->allocation_begin = allocation;
             alloc_entry->size = requested_size;
+            context_mode_t old_mode = context.mode;
             context.mode = PASSTHROUGH;
             alloc_entry->when_allocated = time_in_ns();
-            context.mode = ACTIVE;
+            context.mode = old_mode;
             alloc_entry->magic = ALLOC_ENTRY_MAGIC;
 
-            // .. and if we aren't in PASSTHROUGH mode, insert it in the list
-            // of alloc_entry_t.
+            // If we're in PASSTHROUGH mode, we skip accounting.
             alloc_entry->prev = NULL;
-            if (context.mode != PASSTHROUGH) {
+            if (context.mode == PASSTHROUGH) {
+                alloc_entry->next = NULL;
+            } else {
                 if (context.head != NULL) {
                     alloc_entry->next = context.head;
                     alloc_entry->next->prev = alloc_entry;
@@ -316,11 +329,8 @@ void *malloc_inner(size_t requested_size, int alignment) {
                     alloc_entry->next = NULL;
                 }
                 context.head = alloc_entry;
-            } else {
-                alloc_entry->next = NULL;
+                context.lifetime_allocations++;
             }
-
-            context.lifetime_allocations++;
         }
         break;
     }
