@@ -28,6 +28,7 @@ char *align(char *p, int alignment) {
     }
 }
 
+// printf needs an implementation of _putchar.
 void _putchar(char c) {
     write(STDERR_FILENO, &c, 1);
 }
@@ -95,53 +96,6 @@ static uint64_t time_in_ns(void) {
     return (ts.tv_sec * (int64_t)1000000000) + ts.tv_nsec;
 }
 
-static void maybe_init(void) {
-    // We need to know if we are INITIALIZING already, because if we are, we
-    // don't want to enter the initialization code (below), which we are
-    // already executing! I don't see a way to check if we already hold the
-    // mutex, except this thread-local variable.
-    if (this_thread_has_init_mutex) {
-        ASSERT(context.mode == INITIALIZING);
-    } else {
-        ASSERT(pthread_mutex_lock(&context.mutex_for_init) == 0);
-        if (context.mode == COLD_AND_DARK) {
-            // Establish that we are initializing, so that the following
-            // reentrant calls to/from dlsym() know to use the crutch logic for
-            // allocation functions.
-            context.mode = INITIALIZING;
-            this_thread_has_init_mutex = 1;
-            for (int i = 0; i < N_PREALLOCATIONS; i++) {
-                context.preallocations[i].is_free = 1;
-            }
-
-            // NB: gcc's `-pedantic` doesn't allow assignments from "data
-            // pointers" to "function pointers":
-            // https://gcc.gnu.org/bugzilla/show_bug.cgi?id=83584
-            // These pointer manipulations are a workaround documented in this
-            // POSIX manpage:
-            // https://pubs.opengroup.org/onlinepubs/009695399/functions/dlsym.html
-            *(void **)(&context.system_malloc) = get_system_fp("malloc");
-            *(void **)(&context.system_free) = get_system_fp("free");
-
-            // We should be able to use PASSTHROUGH mode for the rest of
-            // initialization.
-            context.mode = PASSTHROUGH;
-            pthread_mutexattr_t attr;
-            ASSERT(pthread_mutexattr_init(&attr) == 0);
-            ASSERT(pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE) == 0);
-            ASSERT(pthread_mutex_init(&context.mutex, &attr) == 0);
-            context.when_started = time_in_ns();
-            context.lifetime_allocations = 0;
-            context.head = NULL;
-
-            // We're done!
-            context.mode = ACTIVE;
-            this_thread_has_init_mutex = 0;
-        }
-        ASSERT(pthread_mutex_unlock(&context.mutex_for_init) == 0);
-    }
-}
-
 typedef struct {
     uint64_t lower;
     uint64_t upper;
@@ -151,12 +105,9 @@ typedef struct {
 #define STATS_N_SIZE_BINS 12
 #define STATS_N_AGE_BINS 4
 struct {
-    uint64_t when_last_printed;
     stats_bin_t size_bins[STATS_N_SIZE_BINS];
     stats_bin_t age_bins[STATS_N_AGE_BINS];
-} stats = {
-    .when_last_printed = 0
-};
+} stats;
 
 static stats_bin_t *find_bin(stats_bin_t *bins, int bin_count, uint64_t value) {
     for (int i = 0; i < bin_count; i++) {
@@ -196,79 +147,127 @@ static void print_binned_stats(char *type, char *unit, stats_bin_t *bins, int n_
     printf("\n");
 }
 
-static void maybe_print_stats(void) {
-    ASSERT(pthread_mutex_lock(&context.mutex) == 0);
+void *reporting_thread(void *_) {
+    while(1) {
+        unsigned int to_sleep = 5;
+        while ((to_sleep = sleep(to_sleep)) != 0);
 
-    // It only makes sense to print stats while ACTIVE.
-    if (context.mode != ACTIVE) {
-        ASSERT(pthread_mutex_unlock(&context.mutex) == 0);
-        return;
-    }
+        ASSERT(pthread_mutex_lock(&context.mutex) == 0);
 
-    // Any allocations we do here (asctime, gmtime definitely malloc at least
-    // once) shouldn't count.
-    ASSERT(context.mode == ACTIVE);
-    context.mode = PASSTHROUGH;
+        // Any allocations we do here (asctime, gmtime definitely mallocs at
+        // least once) shouldn't count.
+        ASSERT(context.mode == ACTIVE);
+        context.mode = PASSTHROUGH;
 
-    // Only print stats at most every 5 seconds.
-    uint64_t now = time_in_ns();
-    if (now - stats.when_last_printed < 5e9) {
+        // Print the stats header with the current UTC datetime.
+        time_t t = time(NULL);
+        struct tm gmt;
+        gmtime_r(&t, &gmt);
+        char s[64];
+        asctime_r(&gmt, s);
+        s[strlen(s) - 1] = '\0';
+        printf(">>>>>>>>>>>>>>>> %s <<<<<<<<<<<<<<<<\n", s);
+
+        // Set up the bins.
+        uint64_t prev_size_bin_upper = 0;
+        for (int i = 0; i < STATS_N_SIZE_BINS; i++) {
+            stats.size_bins[i].lower = prev_size_bin_upper;
+            stats.size_bins[i].upper = prev_size_bin_upper = pow(2, 2 + i);
+            stats.size_bins[i].count = 0;
+        }
+        prev_size_bin_upper = 0;
+        for (int i = 0; i < STATS_N_AGE_BINS; i++) {
+            stats.age_bins[i].lower = prev_size_bin_upper;
+            stats.age_bins[i].upper = prev_size_bin_upper = pow(10, i);
+            stats.age_bins[i].count = 0;
+        }
+
+        // Walk through all alloc_entry_t to get stats.
+        uint64_t now = time_in_ns();
+        uint64_t current_allocations = 0;
+        uint64_t currently_allocated_bytes = 0;
+        for (alloc_entry_t *p = context.head; p != NULL; p = p->next) {
+            current_allocations++;
+            currently_allocated_bytes += p->size;
+
+            // Size bins.
+            stats_bin_t *bin = find_bin(stats.size_bins, STATS_N_SIZE_BINS, p->size);
+            ASSERT(bin != NULL);
+            bin->count++;
+
+            // Age bins.
+            uint64_t age_in_s = (now - p->when_allocated) / 1e9;
+            bin = find_bin(stats.age_bins, STATS_N_AGE_BINS, age_in_s);
+            ASSERT(bin != NULL);
+            bin->count++;
+        }
+
+        printf("Overall stats:\n");
+        printf("%i Current allocations\n", current_allocations);
+        printf("%i Overall allocations since start\n", context.lifetime_allocations);
+        printf("%.2fMiB Current total allocated size\n\n", currently_allocated_bytes / pow(1024, 2));
+        print_binned_stats("size", "bytes", stats.size_bins, STATS_N_SIZE_BINS);
+        print_binned_stats("age", "sec", stats.age_bins, STATS_N_AGE_BINS);
+
+        // Go back to normal operation now that there's no more danger of malloc.
         context.mode = ACTIVE;
+
         ASSERT(pthread_mutex_unlock(&context.mutex) == 0);
-        return;
-    }
-    stats.when_last_printed = now;
-
-    // Print the stats header with the current UTC datetime.
-    time_t t = time(NULL);
-    char *s = asctime(gmtime(&t));
-    s[strlen(s) - 1] = '\0';
-    printf(">>>>>>>>>>>>>>>> %s <<<<<<<<<<<<<<<<\n", s);
-
-    // Set up the bins.
-    uint64_t prev_size_bin_upper = 0;
-    for (int i = 0; i < STATS_N_SIZE_BINS; i++) {
-        stats.size_bins[i].lower = prev_size_bin_upper;
-        stats.size_bins[i].upper = prev_size_bin_upper = pow(2, 2 + i);
-        stats.size_bins[i].count = 0;
-    }
-    prev_size_bin_upper = 0;
-    for (int i = 0; i < STATS_N_AGE_BINS; i++) {
-        stats.age_bins[i].lower = prev_size_bin_upper;
-        stats.age_bins[i].upper = prev_size_bin_upper = pow(10, i);
-        stats.age_bins[i].count = 0;
     }
 
-    // Walk through all alloc_entry_t to get stats.
-    uint64_t current_allocations = 0;
-    uint64_t currently_allocated_bytes = 0;
-    for (alloc_entry_t *p = context.head; p != NULL; p = p->next) {
-        current_allocations++;
-        currently_allocated_bytes += p->size;
+    ASSERT(0);
+    return NULL;
+}
 
-        // Size bins.
-        stats_bin_t *bin = find_bin(stats.size_bins, STATS_N_SIZE_BINS, p->size);
-        ASSERT(bin != NULL);
-        bin->count++;
+static void maybe_init(void) {
+    // We need to know if we are INITIALIZING already, because if we are, we
+    // don't want to enter the initialization code (below), which we are
+    // already executing! I don't see a way to check if we already hold the
+    // mutex, except this thread-local variable.
+    if (this_thread_has_init_mutex) {
+        ASSERT((context.mode == INITIALIZING) || (context.mode == PASSTHROUGH));
+    } else {
+        ASSERT(pthread_mutex_lock(&context.mutex_for_init) == 0);
+        if (context.mode == COLD_AND_DARK) {
+            // Establish that we are initializing, so that the following
+            // reentrant calls to/from dlsym() know to use the crutch logic for
+            // allocation functions.
+            context.mode = INITIALIZING;
+            this_thread_has_init_mutex = 1;
+            for (int i = 0; i < N_PREALLOCATIONS; i++) {
+                context.preallocations[i].is_free = 1;
+            }
 
-        // Age bins.
-        uint64_t age_in_s = (now - p->when_allocated) / 1e9;
-        bin = find_bin(stats.age_bins, STATS_N_AGE_BINS, age_in_s);
-        ASSERT(bin != NULL);
-        bin->count++;
+            // NB: gcc's `-pedantic` doesn't allow assignments from "data
+            // pointers" to "function pointers":
+            // https://gcc.gnu.org/bugzilla/show_bug.cgi?id=83584
+            // These pointer manipulations are a workaround documented in this
+            // POSIX manpage:
+            // https://pubs.opengroup.org/onlinepubs/009695399/functions/dlsym.html
+            *(void **)(&context.system_malloc) = get_system_fp("malloc");
+            *(void **)(&context.system_free) = get_system_fp("free");
+
+            // We should be able to use PASSTHROUGH mode for the rest of
+            // initialization.
+            context.mode = PASSTHROUGH;
+            pthread_mutexattr_t attr;
+            ASSERT(pthread_mutexattr_init(&attr) == 0);
+            ASSERT(pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE) == 0);
+            ASSERT(pthread_mutex_init(&context.mutex, &attr) == 0);
+            context.when_started = time_in_ns();
+            context.lifetime_allocations = 0;
+            context.head = NULL;
+
+            // Start up the reporting thread.
+            pthread_t thread;
+            ASSERT(pthread_create(&thread, NULL, reporting_thread, NULL) == 0);
+
+            // We're done!
+            context.mode = ACTIVE;
+            this_thread_has_init_mutex = 0;
+        }
+        ASSERT(pthread_mutex_unlock(&context.mutex_for_init) == 0);
     }
-
-    printf("Overall stats:\n");
-    printf("%i Current allocations\n", current_allocations);
-    printf("%i Overall allocations since start\n", context.lifetime_allocations);
-    printf("%.2fMiB Current total allocated size\n\n", currently_allocated_bytes / pow(1024, 2));
-    print_binned_stats("size", "bytes", stats.size_bins, STATS_N_SIZE_BINS);
-    print_binned_stats("age", "sec", stats.age_bins, STATS_N_AGE_BINS);
-
-    // Go back to normal operation now that there's no more danger of malloc.
-    context.mode = ACTIVE;
-
-    ASSERT(pthread_mutex_unlock(&context.mutex) == 0);
 }
 
 void *malloc_inner(size_t requested_size, int alignment) {
@@ -298,7 +297,6 @@ void *malloc_inner(size_t requested_size, int alignment) {
         break;
 
     case ACTIVE:
-        maybe_print_stats();
     case PASSTHROUGH:
         {
             // Use system malloc() to make an allocation big enough to fit the
@@ -379,7 +377,6 @@ void free(void *p) {
         break;
 
     case ACTIVE:
-        maybe_print_stats();
     case PASSTHROUGH:
         {
             int preallocation_i;
