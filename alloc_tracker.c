@@ -152,6 +152,7 @@ void *reporting_thread(void *_) {
         unsigned int to_sleep = 5;
         while ((to_sleep = sleep(to_sleep)) != 0);
 
+        maybe_init();
         ASSERT(pthread_mutex_lock(&context.mutex) == 0);
 
         // Any allocations we do here (asctime, gmtime definitely mallocs at
@@ -272,7 +273,6 @@ static void maybe_init(void) {
 
 void *malloc_inner(size_t requested_size, int alignment) {
     maybe_init();
-
     ASSERT(pthread_mutex_lock(&context.mutex) == 0);
     char *p = NULL;
     switch (context.mode) {
@@ -358,12 +358,11 @@ static void check_if_preallocation_or_true_allocation(void *p, int *preallocatio
 }
 
 void free(void *p) {
-    maybe_init();
-
     if (p == NULL) {
         return;
     }
 
+    maybe_init();
     ASSERT(pthread_mutex_lock(&context.mutex) == 0);
     switch (context.mode) {
     case COLD_AND_DARK:
@@ -417,6 +416,7 @@ void *calloc(size_t n, size_t size) {
 }
 
 void *realloc(void *p, size_t requested_size) {
+    maybe_init();
     ASSERT(pthread_mutex_lock(&context.mutex) == 0);
 
     void *p2 = NULL;
