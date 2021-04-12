@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -28,11 +29,6 @@ char *align(char *p, int alignment) {
     }
 }
 
-// printf needs an implementation of _putchar.
-void _putchar(char c) {
-    write(STDERR_FILENO, &c, 1);
-}
-
 #define ALLOC_ENTRY_MAGIC 0xdeadbeef
 typedef struct alloc_entry {
     void *allocation_begin;
@@ -57,15 +53,7 @@ typedef enum {
 #define N_PREALLOCATIONS 8
 #define PREALLOCATION_SIZE 1024
 struct {
-    // Why separate mutexes: separate threads could race to init(), so we must
-    // have a statically-initialized mutex to resolve that. However, the
-    // pthreads mutex static initializer, PTHREAD_MUTEX_INITIALIZER, specifies
-    // a default (not errorchecking, not recursive) mutex, which isn't what we
-    // want for actual operation. There exists
-    // PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP in glibc, but that isn't
-    // portable..
     pthread_mutex_t mutex_for_init;
-    pthread_mutex_t mutex;
     context_mode_t mode;
     struct {
         int is_free;
@@ -73,11 +61,24 @@ struct {
     } preallocations[N_PREALLOCATIONS];
     void *(*system_malloc)(size_t);
     void (*system_free)(void *);
+    // Why separate mutexes: separate threads could race to init(), so we must
+    // have a statically-initialized mutex to resolve that. However, the
+    // pthreads mutex static initializer, PTHREAD_MUTEX_INITIALIZER, specifies
+    // a default (not errorchecking, not recursive) mutex, which isn't what we
+    // want for actual operation. There exists
+    // PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP in glibc, but that isn't
+    // portable..
+    pthread_mutex_t mutex;
     uint64_t when_started;
     uint64_t lifetime_allocations;
     alloc_entry_t *head;
+    int use_printf_fd;
+    int printf_fd;
+    size_t printf_written;
 } context = {
     .mutex_for_init = PTHREAD_MUTEX_INITIALIZER,
+    .use_printf_fd = 0,
+    .printf_written = 0,
     .mode = COLD_AND_DARK
 };
 
@@ -147,8 +148,70 @@ static void print_binned_stats(char *type, char *unit, stats_bin_t *bins, int n_
     printf("\n");
 }
 
-void *reporting_thread(void *_) {
-    while(1) {
+static void *reporting_thread(void *);
+
+static void maybe_init(void) {
+    // We need to know if we are INITIALIZING already, because if we are, we
+    // don't want to enter the initialization code (below), which we are
+    // already executing! I don't see a way to check if we already hold the
+    // mutex, except this thread-local variable.
+    if (this_thread_has_init_mutex) {
+        ASSERT((context.mode == INITIALIZING) || (context.mode == PASSTHROUGH));
+    } else {
+        ASSERT(pthread_mutex_lock(&context.mutex_for_init) == 0);
+        if (context.mode == COLD_AND_DARK) {
+            // Establish that we are initializing, so that the following
+            // reentrant calls to/from dlsym() know to use the crutch logic for
+            // allocation functions.
+            context.mode = INITIALIZING;
+            this_thread_has_init_mutex = 1;
+            for (int i = 0; i < N_PREALLOCATIONS; i++) {
+                context.preallocations[i].is_free = 1;
+            }
+
+            // NB: gcc's `-pedantic` doesn't allow assignments from "data
+            // pointers" to "function pointers":
+            // https://gcc.gnu.org/bugzilla/show_bug.cgi?id=83584
+            // These pointer manipulations are a workaround documented in this
+            // POSIX manpage:
+            // https://pubs.opengroup.org/onlinepubs/009695399/functions/dlsym.html
+            *(void **)(&context.system_malloc) = get_system_fp("malloc");
+            *(void **)(&context.system_free) = get_system_fp("free");
+
+            // We should be able to use PASSTHROUGH mode for the rest of
+            // initialization.
+            context.mode = PASSTHROUGH;
+            pthread_mutexattr_t attr;
+            ASSERT(pthread_mutexattr_init(&attr) == 0);
+            ASSERT(pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE) == 0);
+            ASSERT(pthread_mutex_init(&context.mutex, &attr) == 0);
+            context.when_started = time_in_ns();
+            context.lifetime_allocations = 0;
+            context.head = NULL;
+            char *fn = getenv("TRACKING_MALLOC_FILENAME");
+            ASSERT(fn != NULL);
+            context.printf_fd = open(fn, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0666);
+            if (context.printf_fd == -1) {
+                printf("TRACKING_MALLOC_FILENAME can't be opened\n");
+                ASSERT(0);
+            }
+            context.use_printf_fd = 1;
+            context.printf_written = 0;
+
+            // Start up the reporting thread.
+            pthread_t thread;
+            ASSERT(pthread_create(&thread, NULL, reporting_thread, NULL) == 0);
+
+            // We're done!
+            context.mode = ACTIVE;
+            this_thread_has_init_mutex = 0;
+        }
+        ASSERT(pthread_mutex_unlock(&context.mutex_for_init) == 0);
+    }
+}
+
+static void *reporting_thread(void *_) {
+    while (1) {
         unsigned int to_sleep = 5;
         while ((to_sleep = sleep(to_sleep)) != 0);
 
@@ -220,55 +283,19 @@ void *reporting_thread(void *_) {
     return NULL;
 }
 
-static void maybe_init(void) {
-    // We need to know if we are INITIALIZING already, because if we are, we
-    // don't want to enter the initialization code (below), which we are
-    // already executing! I don't see a way to check if we already hold the
-    // mutex, except this thread-local variable.
-    if (this_thread_has_init_mutex) {
-        ASSERT((context.mode == INITIALIZING) || (context.mode == PASSTHROUGH));
-    } else {
-        ASSERT(pthread_mutex_lock(&context.mutex_for_init) == 0);
-        if (context.mode == COLD_AND_DARK) {
-            // Establish that we are initializing, so that the following
-            // reentrant calls to/from dlsym() know to use the crutch logic for
-            // allocation functions.
-            context.mode = INITIALIZING;
-            this_thread_has_init_mutex = 1;
-            for (int i = 0; i < N_PREALLOCATIONS; i++) {
-                context.preallocations[i].is_free = 1;
-            }
-
-            // NB: gcc's `-pedantic` doesn't allow assignments from "data
-            // pointers" to "function pointers":
-            // https://gcc.gnu.org/bugzilla/show_bug.cgi?id=83584
-            // These pointer manipulations are a workaround documented in this
-            // POSIX manpage:
-            // https://pubs.opengroup.org/onlinepubs/009695399/functions/dlsym.html
-            *(void **)(&context.system_malloc) = get_system_fp("malloc");
-            *(void **)(&context.system_free) = get_system_fp("free");
-
-            // We should be able to use PASSTHROUGH mode for the rest of
-            // initialization.
-            context.mode = PASSTHROUGH;
-            pthread_mutexattr_t attr;
-            ASSERT(pthread_mutexattr_init(&attr) == 0);
-            ASSERT(pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE) == 0);
-            ASSERT(pthread_mutex_init(&context.mutex, &attr) == 0);
-            context.when_started = time_in_ns();
-            context.lifetime_allocations = 0;
-            context.head = NULL;
-
-            // Start up the reporting thread.
-            pthread_t thread;
-            ASSERT(pthread_create(&thread, NULL, reporting_thread, NULL) == 0);
-
-            // We're done!
-            context.mode = ACTIVE;
-            this_thread_has_init_mutex = 0;
-        }
-        ASSERT(pthread_mutex_unlock(&context.mutex_for_init) == 0);
+// printf needs an implementation of _putchar: we'll print to a file, and
+// truncate it when it gets too big.
+void _putchar(char c) {
+    maybe_init();
+    ASSERT(pthread_mutex_lock(&context.mutex) == 0);
+    int fd = context.use_printf_fd ? context.printf_fd : STDERR_FILENO;
+    while (write(fd, &c, 1) != 1);
+    context.printf_written++;
+    if (context.printf_written > 1024) {
+        ASSERT(ftruncate(context.printf_fd, 0) == 0);
+        context.printf_written = 0;
     }
+    ASSERT(pthread_mutex_unlock(&context.mutex) == 0);
 }
 
 void *malloc_inner(size_t requested_size, int alignment) {

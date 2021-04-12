@@ -71,5 +71,11 @@ The following programs work fine:
 
 So for example to try out python, do:
 ```
-make && LD_PRELOAD=./bin/alloc_tracker.so python
+make && TRACKING_MALLOC_FILENAME=log LD_PRELOAD=./bin/alloc_tracker.so python
+```
+
+In another terminal, follow the log (it'll truncate every so often, no need to
+log-rotate it):
+```
+tail -f log
 ```
