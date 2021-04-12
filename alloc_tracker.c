@@ -290,8 +290,7 @@ void _putchar(char c) {
     ASSERT(pthread_mutex_lock(&context.mutex) == 0);
     int fd = context.use_printf_fd ? context.printf_fd : STDERR_FILENO;
     while (write(fd, &c, 1) != 1);
-    context.printf_written++;
-    if (context.printf_written > 1024) {
+    if (++context.printf_written > 1024) {
         ASSERT(ftruncate(context.printf_fd, 0) == 0);
         context.printf_written = 0;
     }
